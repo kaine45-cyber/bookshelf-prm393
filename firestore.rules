@@ -1,0 +1,75 @@
+rules_version = '2';
+
+// BookShelf — Firestore Security Rules
+//
+// Duplicate protection (same title + author for the same person, any letter case):
+// every book's document id is deterministic:
+//   <uid>_<sha256(lower(trim(title)) + "|" + lower(trim(author)))>
+// The rules below refuse any write whose document id does not match that formula,
+// so a second copy of the same title + author can only land on the SAME document.
+// That is an update, and updates may never change createdAt, so the second save
+// (which always carries a new createdAt) is refused.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function bookKey(d) {
+      return request.auth.uid + '_' +
+        hashing.sha256((d.title.trim().lower() + '|' + d.author.trim().lower()).toUtf8())
+          .toHexString().lower();
+    }
+
+    function validBook(d) {
+      return d.keys().hasAll(['id', 'userId', 'title', 'author', 'genre', 'status', 'favorite', 'createdAt'])
+        && d.keys().hasOnly(['id', 'userId', 'title', 'author', 'genre', 'status', 'rating', 'favorite', 'notes', 'createdAt'])
+        && d.title is string && d.title.trim().size() > 0 && d.title.size() <= 100
+        && d.author is string && d.author.trim().size() > 0 && d.author.size() <= 60
+        && d.genre in ['Fiction', 'Non-Fiction', 'Academic', 'Other']
+        && d.status in ['To Read', 'Reading', 'Finished']
+        && (d.get('rating', null) == null
+            || (d.rating is int && d.rating >= 0 && d.rating <= 5))
+        && (d.get('notes', null) == null
+            || (d.notes is string && d.notes.size() <= 300))
+        && d.favorite is bool
+        && d.createdAt is timestamp;
+    }
+
+    match /books/{bookId} {
+      // Read one book: only your own. A missing document may be read only at an id
+      // that belongs to you (lets the Detail screen notice a deleted book).
+      allow get: if signedIn() && (
+        (resource == null && bookId.matches(request.auth.uid + '_[0-9a-f]{64}'))
+        || (resource != null && resource.data.userId == request.auth.uid)
+      );
+
+      // List books: the query must be filtered to your own userId.
+      allow list: if signedIn() && resource.data.userId == request.auth.uid;
+
+      allow create: if signedIn()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.id == bookId
+        && validBook(request.resource.data)
+        && bookId == bookKey(request.resource.data)
+        && request.resource.data.createdAt <= request.time;
+
+      allow update: if signedIn()
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.id == bookId
+        && request.resource.data.createdAt == resource.data.createdAt
+        && validBook(request.resource.data)
+        && bookId == bookKey(request.resource.data);
+
+      allow delete: if signedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    // Everything else is closed.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
